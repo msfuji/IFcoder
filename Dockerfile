@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -U pip && \
       numpy pandas scikit-image tifffile \
       torch torchvision \
       pytest
+RUN pip install --no-cache-dir \
+      requests
 
 # Make src/ importable without installing the package
 ENV PYTHONPATH=/work/src
