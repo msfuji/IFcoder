@@ -12,9 +12,8 @@ dependencies = [
   "numpy",
   "pandas",
   "tifffile",
-  "scikit-image",
   "torch",
-  "torchvision",
+  "anndata"
 ]
 
 [project.optional-dependencies]
