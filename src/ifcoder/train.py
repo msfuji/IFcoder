@@ -1,9 +1,11 @@
 import argparse
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 from ifcoder.models import ConvVAE, vae_loss
+from ifcoder.io import export_anndata
 
 
 class NPZPatches(Dataset):
@@ -12,6 +14,9 @@ class NPZPatches(Dataset):
         x = d["patches"]  # (N,C,H,W)
         if x.ndim != 4:
             raise ValueError(f"Expected patches with shape (N,C,H,W). Got {x.shape}")
+
+        self.image_numbers = d["image_numbers"] if "image_numbers" in d else None
+        self.centers = d["centers"] if "centers" in d else None
 
         x = x.astype(np.float32)
 
@@ -44,8 +49,8 @@ class NPZPatches(Dataset):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="Input .npz produced by ifcoder.extract")
-    ap.add_argument("--out", default="vae.pt", help="Output checkpoint path")
-    ap.add_argument("--emb-out", default=None, help="Optional output .npz for embeddings")
+    ap.add_argument("--out-emb", default="embeddings.h5ad", help="Output embeddings .h5ad")
+    ap.add_argument("--out-ckpt", default=None, help="Optional checkpoint .pt file")
     ap.add_argument("--patch-size", type=int, default=None, help="Patch size (infer if omitted)")
     ap.add_argument("--latent-dim", type=int, default=16)
     ap.add_argument("--hidden", type=int, default=32)
@@ -88,37 +93,60 @@ def main():
             opt.step()
 
             bs = x.size(0)
-            loss_sum += float(loss) * bs
-            recon_sum += float(recon) * bs
-            kl_sum += float(kl) * bs
+            loss_sum += loss.detach().item() * bs
+            recon_sum += recon.detach().item() * bs
+            kl_sum += kl.detach().item() * bs
             n += bs
 
         print(f"epoch {epoch:03d}  loss={loss_sum/n:.5f}  recon={recon_sum/n:.5f}  kl={kl_sum/n:.5f}")
 
-    # Save checkpoint
-    ckpt = {
-        "state_dict": model.state_dict(),
-        "in_channels": C,
-        "patch_size": patch_size,
-        "latent_dim": args.latent_dim,
-        "hidden": args.hidden,
-        "normalize": args.normalize,
-    }
-    torch.save(ckpt, args.out)
-    print(f"Saved model -> {args.out}")
+    # Compute embeddings (mu) for all patches
+    model.eval()
+    all_mu = []
+    with torch.no_grad():
+        for i in range(0, len(ds), args.batch_size):
+            x = ds.x[i : i + args.batch_size].to(device)
+            mu, logvar = model.encode(x)
+            all_mu.append(mu.cpu().numpy())
+    emb = np.concatenate(all_mu, axis=0)
+    # np.savez_compressed(args.emb_out, mu=emb)
+    # print(f"Saved embeddings -> {args.emb_out}  shape={emb.shape}")
 
-    # Optional: export embeddings (mu) for all patches
-    if args.emb_out:
-        model.eval()
-        all_mu = []
-        with torch.no_grad():
-            for i in range(0, len(ds), args.batch_size):
-                x = ds.x[i : i + args.batch_size].to(device)
-                mu, logvar = model.encode(x)
-                all_mu.append(mu.cpu().numpy())
-        emb = np.concatenate(all_mu, axis=0)
-        np.savez_compressed(args.emb_out, mu=emb)
-        print(f"Saved embeddings -> {args.emb_out}  shape={emb.shape}")
+    # Build obs
+    obs = {}
+    if ds.image_numbers is not None:
+        obs["image_numbers"] = ds.image_numbers
+    if ds.centers is not None:
+        obs["center_x"] = ds.centers[:, 0]
+        obs["center_y"] = ds.centers[:, 1]
+
+    obs = pd.DataFrame(obs) if obs else None
+
+    # Export embedding in anndata format
+    export_anndata(
+        embedding=emb,
+        out=args.out_emb,
+        obs=obs,
+        obsm_key="X_ifcoder",
+        uns={
+            "model": "ConvVAE",
+            "latent_dim": args.latent_dim,
+            "normalize": args.normalize,
+        },
+    )
+
+    # Optional: save checkpoint
+    if args.out_ckpt:
+        ckpt = {
+            "state_dict": model.state_dict(),
+            "in_channels": C,
+            "patch_size": patch_size,
+            "latent_dim": args.latent_dim,
+            "hidden": args.hidden,
+            "normalize": args.normalize,
+        }
+        torch.save(ckpt, args.out_ckpt)
+        print(f"Saved model -> {args.out_ckpt}")
 
 
 if __name__ == "__main__":
