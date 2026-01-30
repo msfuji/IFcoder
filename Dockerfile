@@ -17,7 +17,8 @@ RUN pip install --no-cache-dir \
       requests
 RUN pip install --no-cache-dir \
       anndata
-
+RUN pip install --no-cache-dir \
+      'scanpy[leiden]' ipykernel
 # Make src/ importable without installing the package
 ENV PYTHONPATH=/work/src
 
