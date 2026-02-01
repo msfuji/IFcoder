@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 import tifffile as tiff
+import anndata as ad
 
 
 def _detect_channels(df: pd.DataFrame) -> list[str]:
@@ -18,12 +19,17 @@ def _detect_channels(df: pd.DataFrame) -> list[str]:
     channels = [ch for ch in channels if f"PathName_{ch}" in df.columns]
 
     if not channels:
-        raise ValueError("No channels detected. Expected FileName_<CH> and PathName_<CH> columns.")
+        raise ValueError(
+            "No channels detected. Expected FileName_<CH> and PathName_<CH> columns."
+        )
     return channels
 
 
 def _img_paths(row: pd.Series, channels: list[str]) -> list[str]:
-    return [os.path.join(str(row[f"PathName_{ch}"]), str(row[f"FileName_{ch}"])) for ch in channels]
+    return [
+        os.path.join(str(row[f"PathName_{ch}"]), str(row[f"FileName_{ch}"]))
+        for ch in channels
+    ]
 
 
 def _load_stack(paths: list[str]) -> np.ndarray:
@@ -33,7 +39,9 @@ def _load_stack(paths: list[str]) -> np.ndarray:
             raise FileNotFoundError(f"Image not found: {p}")
         img = tiff.imread(p)
         if img.ndim != 2:
-            raise ValueError(f"Expected 2D grayscale TIFF, got shape {img.shape} at {p}")
+            raise ValueError(
+                f"Expected 2D grayscale TIFF, got shape {img.shape} at {p}"
+            )
         imgs.append(img)
     return np.stack(imgs, axis=0)  # (C, H, W)
 
@@ -53,96 +61,162 @@ def _patch(stack: np.ndarray, x: float, y: float, ps: int) -> np.ndarray | None:
 
 def extract(
     cp_csv: str,
-    out_npz: str,
+    out_h5ad: str,
     patch_size: int = 64,
     channels: list[str] | None = None,
 ) -> None:
     """
     Extract multi-channel image patches centered on nuclei based on a CellProfiler CSV
+    and save as AnnData (.h5ad).
 
-    Required columns in the CP CSV:
-      - Location_Center_X
-      - Location_Center_Y
-      - FileName_<CH> and PathName_<CH> for each channel (channel names can vary)
-
-    Saves NPZ keys:
-      - patches: (N, C, P, P)
-      - channels: (C,) channel suffixes (strings)
-      - centers: (N, 2) float32 [x, y]
-      - image_number: (N,) a lightweight identifier for the source image group
+    AnnData layout:
+      - X        : CellProfiler measurements (AreaShape_*, Intensity_*)
+      - obs      : All remaining CP columns (metadata)
+      - obsm     : patches (N, C, P, P)
+      - obs_names: barcodes = ImageNumber_ObjectNumber
     """
     df = pd.read_csv(cp_csv)
+    
+    n_total = len(df)
 
-    if "Location_Center_X" not in df.columns or "Location_Center_Y" not in df.columns:
-        raise ValueError("CSV must contain Location_Center_X and Location_Center_Y columns.")
+    required = {
+        "ImageNumber",
+        "ObjectNumber",
+        "Location_Center_X",
+        "Location_Center_Y",
+    }
+    if not required <= set(df.columns):
+        raise ValueError(f"CSV must contain columns: {required}")
 
     if channels is None:
         channels = _detect_channels(df)
 
-    # Group by image identity so we load each multi-channel image once
+    # ---------------------------------------
+    # define measurement vs metadata columns
+    # ---------------------------------------
+    meas_cols = [
+        c
+        for c in df.columns
+        if c.startswith("AreaShape_") or c.startswith("Intensity_")
+    ]
+    obs_cols = [c for c in df.columns if c not in meas_cols]
+
+    # ---------------------------------------
+    # grouping: load each image stack once
+    # ---------------------------------------
     group_cols = []
     for ch in channels:
         group_cols += [f"PathName_{ch}", f"FileName_{ch}"]
 
     patches = []
     centers = []
-    image_numbers = []
+    keep_rows = []
 
     for _, g in df.groupby(group_cols):
-        # Load image stack once for this group
         paths = _img_paths(g.iloc[0], channels)
         stack = _load_stack(paths)
 
-        # Use a stable "image key" for metadata (first channel filename is enough)
-        key = os.path.basename(paths[0])
-
-        for x, y in zip(g["Location_Center_X"].values, g["Location_Center_Y"].values):
-            p = _patch(stack, x, y, patch_size)
+        for idx, row in g.iterrows():
+            p = _patch(
+                stack,
+                row["Location_Center_X"],
+                row["Location_Center_Y"],
+                patch_size,
+            )
             if p is None:
                 continue
+
             patches.append(p)
-            centers.append((float(x), float(y)))
-            image_numbers.append(key)
+            centers.append(
+                (row["Location_Center_X"], row["Location_Center_Y"])
+            )
+            keep_rows.append(idx)
 
     if not patches:
-        raise RuntimeError("No patches extracted. Check patch_size and coordinate ranges.")
+        raise RuntimeError(
+            "No patches extracted. Check patch_size and coordinate ranges."
+        )
 
-    patches = np.stack(patches, axis=0)  # (N, C, P, P)
+    n_kept = len(patches)
+    n_dropped = n_total - n_kept
 
-    np.savez_compressed(
-        out_npz,
-        patches=patches,
-        channels=np.array(channels, dtype=object),
-        centers=np.array(centers, dtype=np.float32),
-        image_number=np.array(image_numbers, dtype=object),
+    # ---------------------------------------
+    # subset dataframe to kept cells
+    # ---------------------------------------
+    df = df.loc[keep_rows].reset_index(drop=True)
+
+    patches = np.stack(patches, axis=0).astype(np.float32)  # (N, C, P, P)
+    centers = np.asarray(centers, dtype=np.float32)
+
+    # ---------------------------------------
+    # build AnnData
+    # ---------------------------------------
+    X = df[meas_cols].to_numpy(dtype=np.float32)
+    obs = df[obs_cols].copy()
+
+    barcodes = (
+        "img"
+        + df["ImageNumber"].astype(str)
+        + "_obj"
+        + df["ObjectNumber"].astype(str)
     )
+    obs.index = barcodes
+
+    adata = ad.AnnData(X=X, obs=obs)
+    adata.obs_names = barcodes
+    adata.var_names = meas_cols
+
+    adata.obsm["patches"] = patches
+    adata.obsm["centers"] = centers
+
+    adata.uns["ifcoder"] = {
+        "patch_size": patch_size,
+        "channels": channels,
+        "source": "CellProfiler",
+        "edge_filtered": True,
+    }
+
+    adata.write_h5ad(out_h5ad)
 
     print(f"Detected channels: {channels}")
-    print(f"Saved {patches.shape[0]} patches (C={patches.shape[1]}, P={patches.shape[2]}) -> {out_npz}")
+    print(f"Saved AnnData -> {out_h5ad}")
+    print(f"Cells in CSV        : {n_total}")
+    print(f"Cells kept (patches): {n_kept}")
+    print(f"Cells dropped (edge): {n_dropped} "
+          f"({n_dropped / n_total:.1%})")
+    print(f"Measurements: {adata.n_vars}")
+    print(f"Dimensions of patches: {patches.shape}")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Extract multi-channel nucleus-centered patches from a CellProfiler Nuclei.csv"
+        description=(
+            "Extract multi-channel nucleus-centered patches from a "
+            "CellProfiler Nuclei.csv and save as AnnData (.h5ad)"
+        )
     )
     parser.add_argument("--cp-csv", required=True, help="Path to CellProfiler Nuclei.csv")
-    parser.add_argument("--out", required=True, help="Output .npz path")
-    parser.add_argument("--patch-size", type=int, default=64, help="Patch size (pixels), default=64")
+    parser.add_argument("--out", required=True, help="Output .h5ad path")
+    parser.add_argument(
+        "--patch-size", type=int, default=64, help="Patch size (pixels), default=64"
+    )
     parser.add_argument(
         "--channels",
         nargs="*",
         default=None,
-        help="Optional list of channel suffixes (after FileName_/PathName_). "
-             "If omitted, auto-detect from CSV.",
+        help=(
+            "Optional list of channel suffixes (after FileName_/PathName_). "
+            "If omitted, auto-detect from CSV."
+        ),
     )
 
     args = parser.parse_args()
 
     extract(
         cp_csv=args.cp_csv,
-        out_npz=args.out,
+        out_h5ad=args.out,
         patch_size=args.patch_size,
         channels=args.channels,
     )
