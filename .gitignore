@@ -18,8 +18,6 @@ build/
 dist/
 *.egg-info/
 
-# example images
-examples/cp_input/*
-examples/cp_output/*
-!examples/cp_input/.gitkeep
-!examples/cp_output/.gitkeep
+# example data
+*.h5ad
+*.zip
