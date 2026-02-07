@@ -188,7 +188,7 @@ def extract(
     print(f"Dimensions of patches: {patches.shape}")
 
 
-if __name__ == "__main__":
+def main():
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -220,3 +220,7 @@ if __name__ == "__main__":
         patch_size=args.patch_size,
         channels=args.channels,
     )
+
+
+if __name__ == "__main__":
+    main()
