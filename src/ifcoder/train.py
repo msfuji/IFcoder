@@ -13,7 +13,14 @@ from ifcoder.models import ConvVAE, vae_loss
 # -------------------------
 
 class AnnDataPatches(Dataset):
-    def __init__(self, h5ad_path: str, normalize: str = "per_channel"):
+    def __init__(
+        self,
+        h5ad_path: str,
+        normalize: str = "per_channel",
+        augment: bool = True,
+        aug_sigma: float = 0.05,
+        aug_scale_range: tuple[float, float] = (0.95, 1.05),
+    ):
         adata = ad.read_h5ad(h5ad_path)
 
         if "patches" not in adata.obsm:
@@ -41,12 +48,29 @@ class AnnDataPatches(Dataset):
 
         self.x = torch.from_numpy(x)
         self.adata = adata  # keep reference for later
+        self.augment = augment
+        self.aug_sigma = aug_sigma
+        self.aug_scale_range = aug_scale_range
 
     def __len__(self):
         return self.x.shape[0]
 
     def __getitem__(self, idx):
-        return self.x[idx]
+        x = self.x[idx]
+        if self.augment:
+            # Random horizontal flip
+            if torch.rand(1).item() > 0.5:
+                x = x.flip(-1)
+            # Random vertical flip
+            if torch.rand(1).item() > 0.5:
+                x = x.flip(-2)
+            # Random per-channel intensity scaling
+            lo, hi = self.aug_scale_range
+            scale = lo + (hi - lo) * torch.rand(x.shape[0], 1, 1)
+            x = x * scale
+            # Gaussian noise
+            x = x + self.aug_sigma * torch.randn_like(x)
+        return x
 
 
 # -------------------------
@@ -71,12 +95,22 @@ def main():
         default="per_channel",
         choices=["per_channel", "per_patch", "none"],
     )
+    ap.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
+    ap.add_argument("--aug-sigma", type=float, default=0.05, help="Gaussian noise sigma")
+    ap.add_argument("--aug-scale-low", type=float, default=0.95, help="Min channel intensity scale")
+    ap.add_argument("--aug-scale-high", type=float, default=1.05, help="Max channel intensity scale")
     args = ap.parse_args()
 
     # -------------------------
     # load dataset
     # -------------------------
-    ds = AnnDataPatches(args.data, normalize=args.normalize)
+    ds = AnnDataPatches(
+        args.data,
+        normalize=args.normalize,
+        augment=not args.no_augment,
+        aug_sigma=args.aug_sigma,
+        aug_scale_range=(args.aug_scale_low, args.aug_scale_high),
+    )
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
