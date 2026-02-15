@@ -29,7 +29,7 @@ are mandatory. Optionally, user can append additional columns of metadata (e.g.,
 - Input images of the CellProfiler pipeline. Image patches will be extracted from them.
 
 ## Example
-please see [ifcoder_example.ipynb](xxx.html).
+please see [ifcoder_example.ipynb](https://github.com/msfuji/IFcoder/blob/main/examples/ifcoder_example.ipynb).
 
 ## Usage
 1. **Extract image patches based on CellProfiler output**
